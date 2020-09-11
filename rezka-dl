@@ -1,0 +1,95 @@
+#!/bin/bash -e
+
+usage() {
+    cat << EOF
+Usage: $(basename $0) [options] <url>
+  -p  Don't download, play in player
+  -q  Manually select quality
+EOF
+    exit 2
+}
+
+download=1
+best_quality=1
+
+while getopts ":pq" opt; do
+    case "$opt" in
+        p) download=0 ;;
+        q) best_quality=0 ;;
+        *) usage ;;
+    esac
+done
+
+shift $((OPTIND - 1))
+
+[ -z $1 ] && usage
+
+die() { echo $1; exit 1; }
+get() { cmd="curl -s -L -A 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:78.0) Gecko/20100101 Firefox/78.0' $1"; [ -z $2 ] || cmd+=" -d $2"; $cmd; }
+voice() { echo $page | grep -oP '(?<=<li title=").*?(?=" class="b-translator__item)' | show "Voice" | sed 's/(/\\\(/g; s/)/\\\)/g; s/\+/\\\+/g'; }
+show() { dmenu -i -l 10 -p "$1:"; }
+
+url=$1
+api_url="$(echo $url | grep -oE '(http|https)://[^/"]+')/ajax/get_cdn_series/" || die "This is not a link"
+page=$(get $url) || die "Page loading error"
+
+id=$(echo $url | grep -oE '/[0-9]+-' | tr -d '/-')
+name=$(echo $page | grep -oP '(?<=h1 itemprop="name">).*?(?=<\/h1)')
+year=$(echo $url | grep -oP '(?<=-)[0-9]+(?=\.html)')
+
+if echo $page | grep -q 'translators-list'; then
+    voices=1
+else
+    voices=0
+fi
+
+if echo $page | grep -q 'initCDNMovies'; then
+    series=0
+elif echo $page | grep -q 'initCDNSeries'; then
+    series=1
+else
+    die 'Video not found'
+fi
+
+if [ $series == 1 ]; then
+    if [ $voices == 1 ]; then
+        voice_id=$(echo $page | grep -oP "(?<=\")[0-9]+(?=\">$(voice)<)")
+    else
+        voice_id=$(echo $page | grep -oP "(?<=initCDNSeriesEvents\($id, ).*?(?=,)")
+    fi
+
+    info=$(get $api_url "id=$id&translator_id=$voice_id&action=get_episodes")
+    season=$(echo $info | grep -oP '(?<=data-tab_id=\\").*?(?=\\")' | tac | show "Season")
+    episode=$(echo $info | grep -oP '(?<=data-season_id=\\"'$season'\\" data-episode_id=\\").*?(?=\\")' | tac | show "Episode")
+    data=$(get $api_url "id=$id&season=$season&episode=$episode&translator_id=$voice_id&action=get_stream")
+
+    filename="${season}x$episode ($name)"
+
+elif [ $series == 0 ]; then
+    if [ $voices == 1 ]; then
+        voice_id=$(echo $page \
+            | grep -oP "(?<=\")[[:alnum:]]*(?=\" data-camrip=\"[[:alnum:]]*\" data-ads=\"[[:alnum:]]*\" data-director=\"[[:alnum:]]*\" data-cdn_quality=\"[[:alnum:]]*\">$(voice)<)")
+        data=$(get $api_url "id=$id&translator_id=$voice_id&action=get_movie")
+    else
+        data=$(echo $page | grep -oP '(?<=initCDNMoviesEvents).*?(?=;)')
+    fi
+
+    filename="$name ($year)"
+fi
+
+streams=$(echo $data | grep -oP '(url|streams)":".*' | sed 's/\\\//\//g' | tr ',' '\n')
+qualities=$(echo "$streams" | sed -nr 's/^\[([0-9]+.*)\].*/\1/p')
+
+if [ $best_quality == 1 ]; then
+    quality=$(echo "$qualities" | tail -1)
+else
+    quality=$(echo "$qualities" | tac | show "Quality")
+fi
+
+stream_url=$(echo $streams | grep -oP "(?<=\[$quality\]).*?(?=:hls)")
+
+if [ $download == 1 ]; then
+    curl -# -C - -L -o "$filename.mp4" $stream_url
+else
+    mpv $stream_url
+fi
